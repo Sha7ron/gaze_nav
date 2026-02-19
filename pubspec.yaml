@@ -1,0 +1,48 @@
+name: gaze_nav
+description: >
+  GazeNav - An accessibility app that enables users with motor disabilities
+  to navigate their phone using eye gaze tracking.
+
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.2.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # --- Camera ---
+  camera: ^0.11.0+2
+
+  # --- ML Kit Face Detection (includes landmarks & contours) ---
+  google_mlkit_face_detection: ^0.12.0
+
+  # --- Permissions ---
+  permission_handler: ^11.3.1
+
+  # --- State Management ---
+  provider: ^6.1.2
+
+  # --- Local Storage (calibration data, settings) ---
+  shared_preferences: ^2.3.5
+
+  # --- REMOVED: device_apps (incompatible with AGP 8+) ---
+  # Will use installed_apps or android_intent_plus later if needed.
+
+  # --- Vector Math ---
+  vector_math: ^2.1.4
+
+  # --- Haptic Feedback ---
+  vibration: ^2.0.0
+
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
