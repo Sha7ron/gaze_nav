@@ -1,4 +1,4 @@
-package com.example.gaze_nav
+package com.example.gaze_nav_app
 
 import io.flutter.embedding.android.FlutterActivity
 
