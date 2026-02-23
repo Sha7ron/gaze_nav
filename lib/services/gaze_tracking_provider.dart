@@ -1,14 +1,18 @@
 /// ===========================================================================
-/// GazeNav - Gaze Tracking Provider
+/// GazeNav - Gaze Tracking Provider v3
 /// ===========================================================================
-/// Central state management class that coordinates all gaze tracking services:
-///   Camera → Face Detection → Gaze Engine → Screen Mapper → Dwell Detector
 ///
-/// This is the single source of truth for gaze state in the app.
-/// Uses ChangeNotifier for Flutter Provider-based state management.
+/// Changes from v2:
+///   - No longer passes CameraImage to GazeEngine (pixel iris detection removed)
+///   - GazeEngine v3 uses contour corner ratios only — no pixel processing
+///   - Guaranteed cursor: if face detected, cursor is ALWAYS shown
+///   - Debug logging to diagnose gaze values in real-time
+///   - Full baseline reset on calibration start
+///
 /// ===========================================================================
 
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:ui';
 
 import 'package:camera/camera.dart';
@@ -22,285 +26,294 @@ import '../services/camera_service.dart';
 import '../services/face_detection_service.dart';
 
 enum TrackingState {
-  uninitialized,
-  initializing,
-  ready,       // Camera ready, not tracking yet
-  tracking,    // Actively tracking gaze
-  calibrating, // In calibration mode
-  error,
+  uninitialized, initializing, ready, tracking, calibrating, error,
 }
 
 class GazeTrackingProvider extends ChangeNotifier {
-  // ── Services ──
-  final CameraService _cameraService = CameraService(targetFps: 15);
-  final FaceDetectionService _faceDetectionService = FaceDetectionService();
-  final GazeEngine _gazeEngine = GazeEngine(smoothingWindow: 5);
-  final ScreenMapper _screenMapper = ScreenMapper();
-  late DwellDetector _dwellDetector;
+  final CameraService _cam = CameraService(targetFps: 15);
+  final FaceDetectionService _fd = FaceDetectionService();
+  final GazeEngine _engine = GazeEngine(smoothingAlpha: 0.25);
+  final ScreenMapper _mapper = ScreenMapper();
+  late DwellDetector _dwell;
 
-  // ── State ──
   TrackingState _state = TrackingState.uninitialized;
   GazeData? _currentGaze;
   Offset? _cursorPosition;
   String? _errorMessage;
   bool _isCalibrated = false;
 
-  // ── Config ──
   GazeConfig _config = GazeConfig();
 
-  // ── Calibration ──
-  List<CalibrationPoint> _calibrationPoints = [];
-  int _currentCalibrationIndex = 0;
-  List<Offset> _calibrationSamples = [];
-  bool _isCollectingSamples = false;
+  // Calibration
+  List<CalibrationPoint> _calPts = [];
+  int _calIndex = 0;
+  List<Offset> _calSamples = [];
+  bool _collecting = false;
 
-  // ── Getters ──
+  // Debug
+  int _frameCount = 0;
+  int _faceDetectedCount = 0;
+  int _gazeComputedCount = 0;
+
+  // Getters
   TrackingState get state => _state;
   GazeData? get currentGaze => _currentGaze;
   Offset? get cursorPosition => _cursorPosition;
   String? get errorMessage => _errorMessage;
   bool get isCalibrated => _isCalibrated;
   GazeConfig get config => _config;
-  DwellDetector get dwellDetector => _dwellDetector;
-  CameraController? get cameraController => _cameraService.controller;
-  double get dwellProgress => _dwellDetector.progress;
-  DwellState get dwellState => _dwellDetector.state;
+  DwellDetector get dwellDetector => _dwell;
+  CameraController? get cameraController => _cam.controller;
+  double get dwellProgress => _dwell.progress;
+  DwellState get dwellState => _dwell.state;
+  int get currentCalibrationIndex => _calIndex;
+  int get totalCalibrationPoints => 9;
 
   GazeTrackingProvider() {
-    _dwellDetector = DwellDetector(
+    _dwell = DwellDetector(
       dwellTimeMs: _config.dwellTimeMs,
       cooldownMs: _config.cooldownMs,
       fixationRadius: _config.fixationRadius,
     );
   }
 
-  /// ─────────────────────────────────────────────────────────────────────
-  /// Initialize camera and detection services
-  /// ─────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════
+  // LIFECYCLE
+  // ═══════════════════════════════════════════════════════════════════
+
   Future<void> initialize() async {
     if (_state == TrackingState.initializing) return;
     _state = TrackingState.initializing;
     notifyListeners();
-
     try {
-      await _cameraService.initialize();
-
-      // Set up frame processing callback
-      _cameraService.onFrame = _onCameraFrame;
-
+      await _cam.initialize();
+      _cam.onFrame = _onFrame;
       _state = TrackingState.ready;
       _errorMessage = null;
     } catch (e) {
       _state = TrackingState.error;
       _errorMessage = 'Camera init failed: $e';
-      debugPrint(_errorMessage);
     }
     notifyListeners();
   }
 
-  /// ─────────────────────────────────────────────────────────────────────
-  /// Start gaze tracking
-  /// ─────────────────────────────────────────────────────────────────────
   Future<void> startTracking() async {
-    if (_state != TrackingState.ready && _state != TrackingState.tracking) {
-      return;
-    }
-
+    if (_state != TrackingState.ready && _state != TrackingState.tracking) return;
     try {
-      await _cameraService.startStreaming();
+      await _cam.startStreaming();
       _state = TrackingState.tracking;
       notifyListeners();
     } catch (e) {
       _state = TrackingState.error;
-      _errorMessage = 'Streaming failed: $e';
+      _errorMessage = 'Stream failed: $e';
       notifyListeners();
     }
   }
 
-  /// ─────────────────────────────────────────────────────────────────────
-  /// Stop gaze tracking
-  /// ─────────────────────────────────────────────────────────────────────
   Future<void> stopTracking() async {
-    await _cameraService.stopStreaming();
+    await _cam.stopStreaming();
     _state = TrackingState.ready;
     _currentGaze = null;
     _cursorPosition = null;
-    _gazeEngine.reset();
-    _dwellDetector.reset();
+    _engine.reset();
+    _dwell.reset();
     notifyListeners();
   }
 
-  /// ─────────────────────────────────────────────────────────────────────
-  /// Set screen size (call from build context)
-  /// ─────────────────────────────────────────────────────────────────────
-  void setScreenSize(Size size) {
-    _screenMapper.setScreenSize(size);
-  }
+  void setScreenSize(Size s) => _mapper.setScreenSize(s);
 
-  /// ─────────────────────────────────────────────────────────────────────
-  /// Process each camera frame
-  /// ─────────────────────────────────────────────────────────────────────
-  void _onCameraFrame(CameraImage image) async {
-    if (_state != TrackingState.tracking && _state != TrackingState.calibrating) {
-      return;
-    }
+  // ═══════════════════════════════════════════════════════════════════
+  // FRAME PROCESSING PIPELINE
+  // ═══════════════════════════════════════════════════════════════════
 
-    final camera = _cameraService.cameraDescription;
-    if (camera == null) return;
+  void _onFrame(CameraImage image) async {
+    if (_state != TrackingState.tracking &&
+        _state != TrackingState.calibrating) return;
 
-    // ── Step 1: Detect faces ──
-    final faces = await _faceDetectionService.detectFaces(image, camera);
+    final cam = _cam.cameraDescription;
+    if (cam == null) return;
+
+    _frameCount++;
+
+    // Step 1: Detect face
+    final faces = await _fd.detectFaces(image, cam);
     if (faces.isEmpty) {
       _currentGaze = null;
       _cursorPosition = null;
-      _gazeEngine.reset();
-      _dwellDetector.reset();
+      _engine.reset();
+      _dwell.reset();
       notifyListeners();
       return;
     }
 
-    // Use first detected face
+    _faceDetectedCount++;
     final face = faces.first;
-    final imageSize = _faceDetectionService.getImageSize(image);
+    final imgSize = _fd.getImageSize(image);
 
-    // ── Step 2: Compute gaze ──
-    final gazeData = _gazeEngine.processface(face, imageSize);
-    if (gazeData == null) return;
+    // Step 2: Compute gaze (NO camera image needed in v3!)
+    final gaze = _engine.processFace(face, imgSize);
 
-    _currentGaze = gazeData;
+    if (gaze == null) {
+      // Face detected but gaze computation failed — shouldn't happen often
+      debugPrint('GazeProvider: face detected but gaze null');
+      return;
+    }
 
-    // ── Step 3: Map to screen ──
+    _gazeComputedCount++;
+    _currentGaze = gaze;
+
+    // Step 3: Map to screen — ALWAYS produce a position when face detected
     if (_isCalibrated) {
-      _cursorPosition = _screenMapper.mapToScreen(gazeData.gazeDirection);
+      _cursorPosition = _mapper.mapToScreen(gaze.gazeDirection)
+          ?? _mapper.mapToScreenUncalibrated(gaze.gazeDirection);
     } else {
-      _cursorPosition = _screenMapper.mapToScreenUncalibrated(gazeData.gazeDirection);
+      _cursorPosition = _mapper.mapToScreenUncalibrated(gaze.gazeDirection);
     }
 
-    // ── Step 4: Feed to dwell detector ──
+    // Step 4: Dwell detection
     if (_cursorPosition != null && _state == TrackingState.tracking) {
-      _dwellDetector.update(_cursorPosition!);
+      _dwell.update(_cursorPosition!);
     }
 
-    // ── Step 5: Collect calibration samples if in calibration mode ──
-    if (_state == TrackingState.calibrating && _isCollectingSamples) {
-      _calibrationSamples.add(gazeData.gazeDirection);
+    // Step 5: Calibration samples
+    if (_state == TrackingState.calibrating && _collecting) {
+      _calSamples.add(gaze.gazeDirection);
+    }
+
+    // Debug logging every 45 frames (~3 seconds)
+    if (_frameCount % 45 == 0) {
+      debugPrint(
+          'GAZE DEBUG: '
+              'dir=(${gaze.gazeDirection.dx.toStringAsFixed(4)}, ${gaze.gazeDirection.dy.toStringAsFixed(4)}) '
+              'cursor=(${_cursorPosition?.dx.toStringAsFixed(0)}, ${_cursorPosition?.dy.toStringAsFixed(0)}) '
+              'conf=${gaze.confidence.toStringAsFixed(2)} '
+              'head=(${gaze.headYaw?.toStringAsFixed(1)}, ${gaze.headPitch?.toStringAsFixed(1)}) '
+              'frames=$_frameCount faces=$_faceDetectedCount gaze=$_gazeComputedCount'
+      );
     }
 
     notifyListeners();
   }
 
-  // ═══════════════════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════
   // CALIBRATION
-  // ═══════════════════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════════
 
-  /// Start calibration mode
   Future<void> startCalibration() async {
-    _calibrationPoints = [];
-    _currentCalibrationIndex = 0;
+    _calPts = [];
+    _calIndex = 0;
     _state = TrackingState.calibrating;
     _isCalibrated = false;
 
-    if (!(_cameraService.controller?.value.isStreamingImages ?? false)) {
-      await _cameraService.startStreaming();
-    }
+    // Full reset: clear baseline so it relearns during calibration
+    _engine.fullReset();
+    _mapper.clearCalibration();
 
+    if (!(_cam.controller?.value.isStreamingImages ?? false)) {
+      await _cam.startStreaming();
+    }
     notifyListeners();
   }
 
-  /// Start collecting samples for the current calibration point
   void startSampleCollection() {
-    _calibrationSamples = [];
-    _isCollectingSamples = true;
+    _calSamples = [];
+    _collecting = true;
   }
 
-  /// Stop collecting and save the calibration point
-  CalibrationPoint? finishSampleCollection(Offset screenPosition) {
-    _isCollectingSamples = false;
+  CalibrationPoint? finishSampleCollection(Offset screenPos) {
+    _collecting = false;
+    if (_calSamples.isEmpty) return null;
 
-    if (_calibrationSamples.isEmpty) return null;
-
-    // Average all samples for this point
-    double sumX = 0, sumY = 0;
-    for (final s in _calibrationSamples) {
-      sumX += s.dx;
-      sumY += s.dy;
+    // Outlier-trimmed average
+    Offset avg;
+    if (_calSamples.length > 5) {
+      final sortedX = List<Offset>.from(_calSamples)
+        ..sort((a, b) => a.dx.compareTo(b.dx));
+      final trim = (_calSamples.length * 0.2).round();
+      final kept = sortedX.sublist(trim, sortedX.length - trim);
+      double sx = 0, sy = 0;
+      for (final s in kept) { sx += s.dx; sy += s.dy; }
+      avg = Offset(sx / kept.length, sy / kept.length);
+    } else {
+      double sx = 0, sy = 0;
+      for (final s in _calSamples) { sx += s.dx; sy += s.dy; }
+      avg = Offset(sx / _calSamples.length, sy / _calSamples.length);
     }
-    final avgGaze = Offset(
-      sumX / _calibrationSamples.length,
-      sumY / _calibrationSamples.length,
-    );
 
-    final point = CalibrationPoint(
-      screenPosition: screenPosition,
-      gazeDirection: avgGaze,
-    );
+    debugPrint('CAL point #$_calIndex: screen=(${screenPos.dx.toStringAsFixed(0)}, ${screenPos.dy.toStringAsFixed(0)}) '
+        'gaze=(${avg.dx.toStringAsFixed(4)}, ${avg.dy.toStringAsFixed(4)}) '
+        'samples=${_calSamples.length}');
 
-    _calibrationPoints.add(point);
-    _currentCalibrationIndex++;
-
-    return point;
+    final pt = CalibrationPoint(screenPosition: screenPos, gazeDirection: avg);
+    _calPts.add(pt);
+    _calIndex++;
+    return pt;
   }
 
-  /// Finish calibration and compute mapping
   bool finishCalibration() {
-    if (_calibrationPoints.length < 5) {
-      debugPrint('Not enough calibration points: ${_calibrationPoints.length}');
+    if (_calPts.length < 5) return false;
+
+    // Check if calibration data has enough variance
+    final gxs = _calPts.map((p) => p.gazeDirection.dx).toList();
+    final gys = _calPts.map((p) => p.gazeDirection.dy).toList();
+    final gxRange = gxs.reduce((a, b) => a > b ? a : b) - gxs.reduce((a, b) => a < b ? a : b);
+    final gyRange = gys.reduce((a, b) => a > b ? a : b) - gys.reduce((a, b) => a < b ? a : b);
+
+    debugPrint('CAL finish: ${_calPts.length} points, '
+        'gaze X range=${gxRange.toStringAsFixed(4)}, Y range=${gyRange.toStringAsFixed(4)}');
+
+    // If gaze range is too small, calibration won't help — skip it
+    if (gxRange < 0.01 && gyRange < 0.01) {
+      debugPrint('CAL SKIPPED: gaze range too small, using uncalibrated mode');
+      _state = TrackingState.tracking;
+      notifyListeners();
       return false;
     }
 
     try {
-      _screenMapper.calibrate(_calibrationPoints);
+      _mapper.calibrate(_calPts);
       _isCalibrated = true;
       _state = TrackingState.tracking;
       notifyListeners();
       return true;
     } catch (e) {
-      debugPrint('Calibration failed: $e');
+      debugPrint('CAL failed: $e');
       _state = TrackingState.tracking;
       notifyListeners();
       return false;
     }
   }
 
-  /// Cancel calibration
   void cancelCalibration() {
-    _isCollectingSamples = false;
+    _collecting = false;
     _state = TrackingState.tracking;
     notifyListeners();
   }
 
-  int get currentCalibrationIndex => _currentCalibrationIndex;
-  int get totalCalibrationPoints => 9;
+  // ═══════════════════════════════════════════════════════════════════
+  // CONFIG
+  // ═══════════════════════════════════════════════════════════════════
 
-  // ═══════════════════════════════════════════════════════════════════════
-  // CONFIGURATION
-  // ═══════════════════════════════════════════════════════════════════════
-
-  void updateConfig(GazeConfig newConfig) {
-    _config = newConfig;
-    _gazeEngine.smoothingWindow = newConfig.smoothingWindow;
-    _cameraService.targetFps = newConfig.targetFps;
-    _dwellDetector = DwellDetector(
-      dwellTimeMs: newConfig.dwellTimeMs,
-      cooldownMs: newConfig.cooldownMs,
-      fixationRadius: newConfig.fixationRadius,
+  void updateConfig(GazeConfig c) {
+    _config = c;
+    _engine.smoothingFactor = c.smoothingWindow / 20.0;
+    _cam.targetFps = c.targetFps;
+    _dwell = DwellDetector(
+      dwellTimeMs: c.dwellTimeMs,
+      cooldownMs: c.cooldownMs,
+      fixationRadius: c.fixationRadius,
     );
     notifyListeners();
   }
 
-  /// Set dwell triggered callback
-  void setDwellCallback(void Function(Offset position)? callback) {
-    _dwellDetector.onDwellTriggered = callback;
+  void setDwellCallback(void Function(Offset)? cb) {
+    _dwell.onDwellTriggered = cb;
   }
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // CLEANUP
-  // ═══════════════════════════════════════════════════════════════════════
 
   @override
   void dispose() {
-    _cameraService.dispose();
-    _faceDetectionService.dispose();
+    _cam.dispose();
+    _fd.dispose();
     super.dispose();
   }
 }
